@@ -720,7 +720,8 @@ class MCState(VariationalState):
 @partial(jax.jit, static_argnames=("kernel", "apply_fun", "shape"))
 def _local_estimators_kernel(kernel, apply_fun, shape, variables, samples, extra_args):
     O_loc = kernel(apply_fun, variables, samples, extra_args)
-
+    if isinstance(O_loc, tuple):
+        return tuple(O.reshape(shape) for O in O_loc)
     return O_loc.reshape(shape)
 
 
