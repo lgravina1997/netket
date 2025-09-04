@@ -60,6 +60,49 @@ def to_array(
     Returns:
         Array: The computed array.
     """
+    log_psi = to_log_array(
+        hilbert, apply_fun, variables, allgather=allgather, chunk_size=chunk_size
+    )
+
+    if normalize:
+        # Subtract max for numerical stability before exponentiating
+        log_psi = log_psi - log_psi.real.max()
+
+    psi = jnp.exp(log_psi)
+
+    if normalize:
+        norm = jnp.linalg.norm(psi)
+        psi = psi / norm
+
+    return psi
+
+
+def to_log_array(
+    hilbert: DiscreteHilbert,
+    apply_fun: Callable[[PyTree, Array], Array],
+    variables: PyTree,
+    *,
+    allgather: bool = True,
+    chunk_size: int | None = None,
+) -> Array:
+    """
+    Computes `apply_fun(variables, states)` on all states of `hilbert` and returns
+    the log values as a vector (without exponentiating).
+
+    This is numerically stable for exact sampling where we need log probabilities.
+
+    Args:
+        allgather:
+            If allgather=True, the final log array is a fully replicated array.
+            If allgather=False, the final log array is a sharded array, padded
+            with zeros to the next multiple of the number of devices.
+        chunk_size: Optional integer to specify the largest chunks of samples that
+            the model will be evaluated upon. By default it is `None`, and when specified
+            samples are split into chunks of at most `chunk_size`.
+
+    Returns:
+        Array: The computed log array.
+    """
     if not hilbert.is_indexable:
         raise RuntimeError("The hilbert space is not indexable")
 
@@ -74,37 +117,35 @@ def to_array(
         mask = None
         n_states = xs.shape[0]
 
-    psi = _to_array_rank(
+    log_psi = _to_log_array_rank(
         apply_fun,
         variables,
         xs,
         n_states,
-        normalize,
         allgather,
         chunk_size,
         mask,
     )
 
     if allgather and config.netket_experimental_sharding:  # type: ignore
-        psi = np.asarray(extract_replicated(psi))
+        log_psi = np.asarray(extract_replicated(log_psi))
 
-    return psi
+    return log_psi
 
 
-@partial(jax.jit, static_argnums=(0, 3, 4, 5, 6))
-def _to_array_rank(
+@partial(jax.jit, static_argnums=(0, 3, 4, 5))
+def _to_log_array_rank(
     apply_fun,
     variables,
     σ_rank,
     n_states,
-    normalize,
     allgather,
     chunk_size,
     mask=None,
 ):
     """
-    Computes apply_fun(variables, σ_rank) and gathers all results across all ranks.
-    The input σ_rank can be sharded.
+    Computes apply_fun(variables, σ_rank) and gathers all results across all ranks,
+    keeping the results in log space for numerical stability.
 
     Args:
         n_states: total number of elements in the hilbert space.
@@ -124,37 +165,26 @@ def _to_array_rank(
     if n_fake_states > 0:
         log_psi_local = log_psi_local.at[-n_fake_states:].set(-jnp.inf)
 
-    if normalize:
-        # subtract logmax for better numerical stability
-        log_psi_local -= log_psi_local.real.max()
-
-    psi_local = jnp.exp(log_psi_local)
-
     if mask is not None:
         # when running under netket_experimental_sharding,
         # we pad the Hilbert space with extra fake entries,
-        # which in here we mask out to 0
-        psi_local = psi_local * mask
-
-    if normalize:
-        # compute normalization
-        norm2 = jnp.linalg.norm(psi_local) ** 2
-        psi_local /= jnp.sqrt(norm2)
+        # which in here we mask out to -inf (log(0))
+        log_psi_local = jnp.where(mask, log_psi_local, -jnp.inf)
 
     if allgather:
-        psi = psi_local.reshape(-1)
+        log_psi = log_psi_local.reshape(-1)
     else:
-        psi = psi_local
+        log_psi = log_psi_local
 
     # gather/replicate
     if allgather and config.netket_experimental_sharding:  # type: ignore
         sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-        psi = jax.lax.with_sharding_constraint(psi, sharding)
+        log_psi = jax.lax.with_sharding_constraint(log_psi, sharding)
 
     # remove fake states
-    psi = psi[0:n_states]
+    log_psi = log_psi[0:n_states]
 
-    return psi
+    return log_psi
 
 
 def to_matrix(

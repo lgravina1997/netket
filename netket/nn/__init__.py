@@ -50,6 +50,7 @@ from .fast_masked_linear import FastMaskedDense1D, FastMaskedConv1D, FastMaskedC
 
 from .utils import (
     to_array,
+    to_log_array,
     to_matrix,
     binary_encoding,
 )

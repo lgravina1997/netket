@@ -21,7 +21,7 @@ from jax import numpy as jnp
 
 from netket import config
 from netket.hilbert import DiscreteHilbert
-from netket.nn import to_array
+from netket.nn import to_log_array
 from netket.utils.types import PyTree, SeedT, DType
 from netket.utils import struct
 
@@ -29,18 +29,16 @@ from .base import Sampler, SamplerState
 
 
 class ExactSamplerState(SamplerState):
-    pdf: jnp.ndarray = struct.field(serialize=False)
-    pdf_norm: jnp.ndarray = struct.field(serialize=False)
+    log_pdf_unnorm: jnp.ndarray = struct.field(serialize=False)
     rng: jnp.ndarray = struct.field(
         sharded=struct.ShardedFieldSpec(
             sharded=True, deserialization_function="relaxed-rng-key"
         )
     )
 
-    def __init__(self, pdf: Any, rng: Any):
-        self.pdf = pdf
+    def __init__(self, log_pdf_unnorm: Any, rng: Any):
+        self.log_pdf_unnorm = log_pdf_unnorm
         self.rng = rng
-        self.pdf_norm = jnp.zeros((), dtype=self.pdf.dtype)
         super().__init__()
 
     def __repr__(self):
@@ -84,18 +82,17 @@ class ExactSampler(Sampler):
         parameters: PyTree,
         seed: SeedT | None = None,
     ):
-        pdf = jnp.zeros(self.hilbert.n_states, dtype=jnp.float32)
-        return ExactSamplerState(pdf=pdf, rng=seed)
+        log_pdf_unnorm = jnp.zeros(self.hilbert.n_states, dtype=jnp.float32)
+        return ExactSamplerState(log_pdf_unnorm=log_pdf_unnorm, rng=seed)
 
     def _reset(self, machine, parameters, state):
-        pdf = jnp.absolute(
-            to_array(self.hilbert, machine.apply, parameters, normalize=False)
-            ** self.machine_pow
-        )
-        pdf_norm = pdf.sum()
-        pdf = pdf / pdf_norm
-
-        return state.replace(pdf=pdf, pdf_norm=pdf_norm)
+        # Compute unnormalized log probabilities directly using log-space function
+        log_psi = to_log_array(self.hilbert, machine.apply, parameters)
+        
+        # Convert to log probabilities: machine_pow * Re(log_psi)
+        log_pdf_unnorm = self.machine_pow * log_psi.real
+        
+        return state.replace(log_pdf_unnorm=log_pdf_unnorm)
 
     @partial(
         jax.jit, static_argnames=("machine", "chain_length", "return_log_probabilities")
@@ -115,6 +112,12 @@ class ExactSampler(Sampler):
         # go, since it's not really a chain anyway. This will be much faster because
         # we call into python only once.
         new_rng, rng = jax.random.split(state.rng)
+        
+
+        # jax.random.choice normalizes internally, so we can use unnormalized probabilities
+        log_probs = state.log_pdf_unnorm
+        probs = jnp.exp(log_probs - jnp.max(log_probs))  # Remove the max for numerical stability
+        
         numbers = jax.random.choice(
             rng,
             self.hilbert.n_states,
@@ -123,7 +126,7 @@ class ExactSampler(Sampler):
                 chain_length,
             ),
             replace=True,
-            p=state.pdf,
+            p=probs,
         )
 
         samples = self.hilbert.numbers_to_states(numbers).astype(self.dtype)
@@ -136,7 +139,7 @@ class ExactSampler(Sampler):
             )
 
         if return_log_probabilities:
-            log_probabilities = jnp.log(state.pdf[numbers]) + jnp.log(state.pdf_norm)
+            log_probabilities = state.log_pdf_unnorm[numbers]
             if config.netket_experimental_sharding:
                 log_probabilities = jax.lax.with_sharding_constraint(
                     log_probabilities,
