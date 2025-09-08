@@ -145,8 +145,7 @@ def _to_log_array_rank(
     mask=None,
 ):
     """
-    Computes apply_fun(variables, σ_rank) and gathers all results across all ranks,
-    keeping the results in log space for numerical stability.
+    Computes apply_fun(variables, σ_rank), possibly enforcing a replicated sharding.
 
     Args:
         n_states: total number of elements in the hilbert space.
