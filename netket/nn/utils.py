@@ -88,9 +88,7 @@ def to_log_array(
 ) -> Array:
     """
     Computes `apply_fun(variables, states)` on all states of `hilbert` and returns
-    the log values as a vector (without exponentiating).
-
-    This is numerically stable for exact sampling where we need log probabilities.
+    the log amplitudes as a (possibly replicated) vector.
 
     Args:
         allgather:
