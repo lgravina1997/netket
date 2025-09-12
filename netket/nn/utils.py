@@ -42,6 +42,7 @@ def to_array(
     normalize: bool = True,
     allgather: bool = True,
     chunk_size: int | None = None,
+    return_log: bool = False,
 ) -> Array:
     """
     Computes `apply_fun(variables, states)` on all states of `hilbert` and returns
@@ -56,12 +57,19 @@ def to_array(
         chunk_size: Optional integer to specify the largest chunks of samples that
             the model will be evaluated upon. By default it is `None`, and when specified
             samples are split into chunks of at most `chunk_size`.
+        return_log: If True, also returns the unnormalized log amplitudes.
 
     Returns:
-        Array: The computed array.
+        Array: The computed amplitudes. If return_log=True, returns unnormalized log_amplitudes,
+        if False returns (possibly normalized) amplitudes.
     """
     if not hilbert.is_indexable:
         raise RuntimeError("The hilbert space is not indexable")
+
+    if normalize and return_log:
+        raise ValueError(
+            "Cannot use normalize=True and return_log=True at the same time."
+        )
 
     apply_fun = get_afun_if_module(apply_fun)
 
@@ -74,7 +82,7 @@ def to_array(
         mask = None
         n_states = xs.shape[0]
 
-    psi = _to_array_rank(
+    psi_or_logpsi = _to_array_rank(
         apply_fun,
         variables,
         xs,
@@ -83,15 +91,15 @@ def to_array(
         allgather,
         chunk_size,
         mask,
+        return_log,
     )
 
     if allgather and config.netket_experimental_sharding:  # type: ignore
-        psi = np.asarray(extract_replicated(psi))
+        psi_or_logpsi = np.asarray(extract_replicated(psi_or_logpsi))
+    return psi_or_logpsi
 
-    return psi
 
-
-@partial(jax.jit, static_argnums=(0, 3, 4, 5, 6))
+@partial(jax.jit, static_argnums=(0, 3, 4, 5, 6, 8))
 def _to_array_rank(
     apply_fun,
     variables,
@@ -101,6 +109,7 @@ def _to_array_rank(
     allgather,
     chunk_size,
     mask=None,
+    return_log=False,
 ):
     """
     Computes apply_fun(variables, σ_rank) and gathers all results across all ranks.
@@ -124,37 +133,44 @@ def _to_array_rank(
     if n_fake_states > 0:
         log_psi_local = log_psi_local.at[-n_fake_states:].set(-jnp.inf)
 
-    if normalize:
-        # subtract logmax for better numerical stability
-        log_psi_local -= log_psi_local.real.max()
+    if return_log:
+        if mask is not None:
+            # Apply mask to log space: add 0 where mask is True, -inf where False
+            log_mask = jnp.where(mask, 0.0, -jnp.inf)
+            log_psi_local = log_psi_local + log_mask
+        return log_psi_local
 
-    psi_local = jnp.exp(log_psi_local)
-
-    if mask is not None:
-        # when running under netket_experimental_sharding,
-        # we pad the Hilbert space with extra fake entries,
-        # which in here we mask out to 0
-        psi_local = psi_local * mask
-
-    if normalize:
-        # compute normalization
-        norm2 = jnp.linalg.norm(psi_local) ** 2
-        psi_local /= jnp.sqrt(norm2)
-
-    if allgather:
-        psi = psi_local.reshape(-1)
     else:
-        psi = psi_local
+        if normalize:
+            # subtract logmax for better numerical stability
+            log_psi_local -= log_psi_local.real.max()
 
-    # gather/replicate
-    if allgather and config.netket_experimental_sharding:  # type: ignore
-        sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-        psi = jax.lax.with_sharding_constraint(psi, sharding)
+        psi_local = jnp.exp(log_psi_local)
 
-    # remove fake states
-    psi = psi[0:n_states]
+        if mask is not None:
+            # when running under netket_experimental_sharding,
+            # we pad the Hilbert space with extra fake entries,
+            # which in here we mask out to 0
+            psi_local = psi_local * mask
 
-    return psi
+        if normalize:
+            # compute normalization
+            norm2 = jnp.linalg.norm(psi_local) ** 2
+            psi_local /= jnp.sqrt(norm2)
+
+        if allgather:
+            psi = psi_local.reshape(-1)
+        else:
+            psi = psi_local
+
+        # gather/replicate
+        if allgather and config.netket_experimental_sharding:  # type: ignore
+            sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
+            psi = jax.lax.with_sharding_constraint(psi, sharding)
+
+        # remove fake states
+        psi = psi[0:n_states]
+        return psi
 
 
 def to_matrix(
@@ -164,19 +180,52 @@ def to_matrix(
     *,
     normalize: bool = True,
     chunk_size: int | None = None,
+    return_log: bool = False,
 ) -> Array:
+    """
+    Computes the density matrix for a doubled Hilbert space.
+
+    Args:
+        hilbert: The doubled Hilbert space.
+        machine: The machine function that computes log amplitudes.
+        params: The parameters of the machine.
+        normalize: If True, the matrix is normalized to have trace 1.
+        chunk_size: Optional chunk size for evaluation.
+        return_log: If True, also returns the unnormalized log density matrix.
+
+    Returns:
+        Array: The computed amplitudes. If return_log=True, returns unnormalized log_amplitudes,
+        if False returns (possibly normalized) amplitudes.
+    """
     if not hilbert.is_indexable:
         raise RuntimeError("The hilbert space is not indexable")
 
-    psi = to_array(hilbert, machine, params, normalize=False, chunk_size=chunk_size)
+    if normalize and return_log:
+        raise ValueError(
+            "Cannot use normalize=True and return_log=True at the same time."
+        )
 
+    psi_or_logpsi = to_array(
+        hilbert,
+        machine,
+        params,
+        normalize=False,
+        chunk_size=chunk_size,
+        return_log=return_log,
+    )
+    
     L = hilbert.physical.n_states
-    rho = psi.reshape((L, L))
-    if normalize:
-        trace = jnp.trace(rho)
-        rho /= trace
-
-    return rho
+    if return_log:
+        log_psi = psi_or_logpsi
+        log_rho = log_psi.reshape((L, L))
+        return log_rho
+    else:
+        psi = psi_or_logpsi
+        rho = psi.reshape((L, L))
+        if normalize:
+            trace = jnp.trace(rho)
+            rho /= trace
+        return rho
 
 
 def _get_output_idx(

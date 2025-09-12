@@ -29,18 +29,16 @@ from .base import Sampler, SamplerState
 
 
 class ExactSamplerState(SamplerState):
-    pdf: jnp.ndarray = struct.field(serialize=False)
-    pdf_norm: jnp.ndarray = struct.field(serialize=False)
+    log_pdf: jnp.ndarray = struct.field(serialize=False)
     rng: jnp.ndarray = struct.field(
         sharded=struct.ShardedFieldSpec(
             sharded=True, deserialization_function="relaxed-rng-key"
         )
     )
 
-    def __init__(self, pdf: Any, rng: Any):
-        self.pdf = pdf
+    def __init__(self, log_pdf: Any, rng: Any):
+        self.log_pdf = log_pdf
         self.rng = rng
-        self.pdf_norm = jnp.zeros((), dtype=self.pdf.dtype)
         super().__init__()
 
     def __repr__(self):
@@ -84,18 +82,18 @@ class ExactSampler(Sampler):
         parameters: PyTree,
         seed: SeedT | None = None,
     ):
-        pdf = jnp.zeros(self.hilbert.n_states, dtype=jnp.float32)
-        return ExactSamplerState(pdf=pdf, rng=seed)
+        log_pdf = jnp.zeros(self.hilbert.n_states, dtype=jnp.float32)
+        return ExactSamplerState(log_pdf=log_pdf, rng=seed)
 
     def _reset(self, machine, parameters, state):
-        pdf = jnp.absolute(
-            to_array(self.hilbert, machine.apply, parameters, normalize=False)
-            ** self.machine_pow
-        )
-        pdf_norm = pdf.sum()
-        pdf = pdf / pdf_norm
-
-        return state.replace(pdf=pdf, pdf_norm=pdf_norm)
+        log_pdf = self.machine_pow * to_array(
+            self.hilbert,
+            machine.apply,
+            parameters,
+            normalize=False,
+            return_log=True,
+        ).real
+        return state.replace(log_pdf=log_pdf)
 
     @partial(
         jax.jit, static_argnames=("machine", "chain_length", "return_log_probabilities")
@@ -123,7 +121,7 @@ class ExactSampler(Sampler):
                 chain_length,
             ),
             replace=True,
-            p=state.pdf,
+            p=jnp.exp(state.log_pdf),
         )
 
         samples = self.hilbert.numbers_to_states(numbers).astype(self.dtype)
@@ -136,7 +134,7 @@ class ExactSampler(Sampler):
             )
 
         if return_log_probabilities:
-            log_probabilities = jnp.log(state.pdf[numbers]) + jnp.log(state.pdf_norm)
+            log_probabilities = state.log_pdf[numbers] 
             if config.netket_experimental_sharding:
                 log_probabilities = jax.lax.with_sharding_constraint(
                     log_probabilities,
