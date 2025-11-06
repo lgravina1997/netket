@@ -86,8 +86,10 @@ class ParticleNumberConservingFermioperator2nd(DiscreteJaxOperator):
         PNCOperatorDataCollectionDict  # custom sparse internal representation
     )
 
-    def get_conn_padded(self, x):
-        return get_conn_padded_pnc(self._operator_data, x, self._hilbert.n_fermions)
+    def get_conn_padded(self, x, subspace_states=None):
+        return get_conn_padded_pnc(
+            self._operator_data, x, self._hilbert.n_fermions, subspace_states
+        )
 
     @property
     def max_conn_size(self):
@@ -322,9 +324,9 @@ class ParticleNumberAndSpinConservingFermioperator2nd(DiscreteJaxOperator):
         _, mels = jax.eval_shape(self.get_conn_padded, x)
         return mels.shape[-1]
 
-    def get_conn_padded(self, x):
+    def get_conn_padded(self, x, subspace_states=None):
         return get_conn_padded_pnc_spin(
-            self._operator_data, x, self._hilbert.n_fermions_per_spin
+            self._operator_data, x, self._hilbert.n_fermions_per_spin, subspace_states
         )
 
     @classmethod

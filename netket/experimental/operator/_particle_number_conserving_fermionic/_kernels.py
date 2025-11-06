@@ -15,6 +15,462 @@ from netket.utils.types import Array
 from ._operator_data import PNCOperatorDataType
 
 
+def _state_to_int(x: Array) -> Array:
+    r"""
+    Convert occupation vector(s) to integer representation for efficient lookup.
+
+    Args:
+        x: occupation vector(s) of shape (..., n_sites)
+    Returns:
+        integer representation of shape (...)
+    """
+    powers = 2 ** jnp.arange(x.shape[-1], dtype=jnp.int64)
+    return jnp.sum(x.astype(jnp.int64) * powers, axis=-1)
+
+
+def _int_to_state(state_int: Array, n_sites: int) -> Array:
+    r"""
+    Convert integer representation(s) back to occupation vector(s).
+
+    Args:
+        state_int: integer representation(s), shape (...)
+        n_sites: number of sites
+    Returns:
+        occupation vector(s) of shape (..., n_sites)
+    """
+    # Use bit operations to extract each bit position
+    powers = 2 ** jnp.arange(n_sites, dtype=jnp.int64)
+    # Broadcast and extract bits
+    return ((state_int[..., None] & powers) > 0).astype(jnp.int8)
+
+
+def _compact_to_subspace(
+    xp: Array, mels: Array, subspace_states: Array
+) -> tuple[Array, Array]:
+    r"""
+    Compact connected elements to subspace-sized arrays for memory efficiency.
+
+    Args:
+        xp: connected states of shape (n_connected, n_sites)
+        mels: matrix elements of shape (n_connected,)
+        subspace_states: sorted array of valid state integers, shape (n_subspace,)
+
+    Returns:
+        xp_compact: states of shape (n_subspace, n_sites), zeros for non-connected
+        mels_compact: matrix elements of shape (n_subspace,), zeros for non-connected
+    """
+    n_subspace = subspace_states.shape[0]
+    n_sites = xp.shape[-1]
+
+    # Initialize output arrays with zeros
+    xp_compact = jnp.zeros((n_subspace, n_sites), dtype=xp.dtype)
+    mels_compact = jnp.zeros(n_subspace, dtype=mels.dtype)
+
+    # Convert connected states to integers
+    xp_ints = _state_to_int(xp)
+
+    # For each connected state, find its index in subspace and place it there
+    # Using searchsorted for O(log n_subspace) lookup per element
+    indices = jnp.searchsorted(subspace_states, xp_ints)
+
+    # Check if the found index is valid and the value matches
+    # (searchsorted can return n_subspace if element > all elements)
+    valid_mask = (indices < n_subspace) & (subspace_states[indices] == xp_ints)
+
+    # Use scatter to place elements at their subspace positions
+    # Only update positions where valid_mask is True
+    xp_compact = xp_compact.at[jnp.where(valid_mask, indices, 0)].set(
+        jnp.where(valid_mask[:, None], xp, 0)
+    )
+    mels_compact = mels_compact.at[jnp.where(valid_mask, indices, 0)].add(
+        jnp.where(valid_mask, mels, 0)
+    )
+
+    return xp_compact, mels_compact
+
+
+def _compute_mel_xy_term(
+    x: Array,
+    y: Array,
+    index_array: Array | COOArray | None,
+    create_array: Array | None,
+    weight_array: Array,
+    n_fermions: int,
+) -> Array:
+    r"""
+    Compute matrix element <y|H_term|x> for a single operator term.
+
+    This function finds ALL (destroy, create) operator pairs within the term
+    that connect x to y, and sums their contributions.
+
+    Args:
+        x: input state (occupation vector)
+        y: target state (occupation vector)
+        index_array, create_array, weight_array: sparse operator data for one term
+        n_fermions: number of fermions
+
+    Returns:
+        matrix element <y|H_term|x> (summed over all contributing paths)
+    """
+    n_sites = x.shape[0]
+
+    # Determine operator order
+    if index_array is not None:
+        half_n_ops = index_array.ndim
+    else:
+        half_n_ops = weight_array.ndim
+
+    # Constant term: y must equal x
+    if half_n_ops == 0:
+        return jnp.where(jnp.all(x == y), weight_array.reshape(()), 0.0)
+
+    # Diagonal term: accumulate contributions from all occupied site combinations
+    is_diagonal_term = (index_array is None)
+    if is_diagonal_term:
+        is_diagonal = jnp.all(x == y)
+
+        # Get occupied sites and compute weight
+        l_occupied = jnp.where(x, size=n_fermions, fill_value=-1)[0]
+        k_destroy = _comb(l_occupied, half_n_ops)
+        weight = weight_array[tuple(k_destroy)]
+
+        # Compute sign for diagonal term
+        sgn = (half_n_ops // 2) % 2
+        sign = 1 - 2 * sgn
+        mel = sign * weight.sum()
+
+        return jnp.where(is_diagonal, mel, 0.0)
+
+    # Off-diagonal: loop over all destroy combinations and accumulate contributions
+    # Get occupied sites in x (potential destroy sites)
+    l_occupied = jnp.where(x, size=n_fermions, fill_value=-1)[0]
+    k_destroy = _comb(l_occupied, half_n_ops)  # Shape: (half_n_ops, n_destroy_combos)
+
+    if k_destroy.shape[1] == 0:
+        return jnp.array(0.0)
+
+    # For each destroy combination, check if any create pattern leads to y
+    def check_destroy_combo(k_d):
+        # Look up create patterns and weights for this destroy combination
+        ind = index_array[tuple(k_d)]
+        weight = weight_array[ind]
+        l_create = create_array[ind]  # Shape: (n_options, half_n_ops) or (half_n_ops,)
+
+        # Normalize to 2D: (n_options, half_n_ops)
+        if l_create.ndim == 1:
+            l_create = l_create.reshape(1, -1)
+            weight = jnp.array([weight]) if jnp.ndim(weight) == 0 else weight.reshape(-1)
+
+        n_options = l_create.shape[0]
+
+        # Apply destroy operators
+        xd = x.at[k_d].set(0)
+
+        # For each create option, check if it produces y
+        def check_create_option(opt_idx):
+            l_c = l_create[opt_idx]
+            w = weight[opt_idx]
+
+            # Apply create operators
+            xp = xd.at[l_c].set(1)
+
+            # Check if this produces y
+            produces_y = jnp.all(xp == y)
+
+            # Check Pauli exclusion (can't create where particle exists)
+            create_was_empty = ~jnp.any(jax.vmap(lambda i: xd[i])(l_c))
+
+            # Compute Jordan-Wigner sign
+            m = jnp.arange(n_sites, dtype=k_d.dtype)
+            jw_mask_destroy = jax.lax.reduce_xor(k_d[:, None] > m, axes=(0,))
+            jw_mask_create = jax.lax.reduce_xor(l_c[:, None] > m, axes=(0,))
+
+            sgn_destroy = jax.lax.reduce_xor(jw_mask_destroy * x, axes=(0,))
+            sgn_create = jax.lax.reduce_xor(jw_mask_create * xd, axes=(0,))
+
+            sgn = sgn_create + sgn_destroy
+            sgn = jax.lax.bitwise_and(sgn, jnp.ones_like(sgn)).astype(bool)
+            sign = 1 - 2 * sgn.astype(np.int8)
+
+            # Return contribution if this path leads to y
+            is_valid = produces_y & create_was_empty
+            return jnp.where(is_valid, w * sign, 0.0)
+
+        # Sum contributions from all create options for this destroy combination
+        contributions = jax.vmap(check_create_option)(jnp.arange(n_options))
+        return jnp.sum(contributions)
+
+    # Sum contributions from all destroy combinations
+    total_mel = jnp.sum(jax.vmap(check_destroy_combo)(k_destroy.T))
+
+    return total_mel
+
+
+def _compute_mel_xy_term_interaction_up_down(
+    x_down: Array,
+    x_up: Array,
+    y_down: Array,
+    y_up: Array,
+    index_array: Array | COOArray | None,
+    create_array: Array | None,
+    weight_array: Array,
+    nelectron_down: int,
+    nelectron_up: int,
+) -> Array:
+    r"""
+    Compute matrix element <y|H_term|x> for mixed spin-sector 2-body interaction.
+
+    This handles operators like: Σ w_ijkl c†_{i↓} c†_{j↑} c_{k↑} c_{l↓}
+
+    Args:
+        x_down, x_up: input states for down and up spins
+        y_down, y_up: target states for down and up spins
+        index_array, create_array, weight_array: sparse operator data
+        nelectron_down, nelectron_up: number of electrons in each sector
+
+    Returns:
+        matrix element <y|H_term|x> (summed over all contributing paths)
+    """
+    n_sites = x_down.shape[0]
+
+    # Diagonal term: both sectors unchanged
+    is_diagonal_term = (index_array is None)
+    if is_diagonal_term:
+        is_diagonal = jnp.all(x_down == y_down) & jnp.all(x_up == y_up)
+
+        # Get occupied sites in each sector
+        down_occupied = jnp.where(x_down, size=nelectron_down, fill_value=-1)[0]
+        up_occupied = jnp.where(x_up, size=nelectron_up, fill_value=-1)[0]
+
+        # Meshgrid to get all (down, up) pairs
+        k_destroy_down, k_destroy_up = jnp.meshgrid(down_occupied, up_occupied)
+        weight = weight_array[k_destroy_down, k_destroy_up]
+
+        sign = 1  # Diagonal terms have positive sign
+        mel = sign * weight.sum()
+
+        return jnp.where(is_diagonal, mel, 0.0)
+
+    # Off-diagonal: loop over all (destroy_down, destroy_up) combinations
+    down_occupied = jnp.where(x_down, size=nelectron_down, fill_value=-1)[0]
+    up_occupied = jnp.where(x_up, size=nelectron_up, fill_value=-1)[0]
+
+    # Create meshgrid of all combinations
+    k_destroy_down, k_destroy_up = jnp.meshgrid(down_occupied, up_occupied)
+    k_destroy_down = k_destroy_down.ravel()
+    k_destroy_up = k_destroy_up.ravel()
+
+    if k_destroy_down.shape[0] == 0:
+        return jnp.array(0.0)
+
+    # For each (destroy_down, destroy_up) pair, check if any create pattern leads to y
+    def check_destroy_combo(k_d_down, k_d_up):
+        # Look up create patterns
+        ind = index_array[k_d_down, k_d_up]
+        weight = weight_array[ind]
+        l_create = create_array[ind]  # Shape: (2,) or (n_options, 2)
+
+        # Normalize to 2D: (n_options, 2)
+        if l_create.ndim == 1:
+            l_create = l_create.reshape(1, -1)
+            weight = jnp.array([weight]) if jnp.ndim(weight) == 0 else weight.reshape(-1)
+
+        n_options = l_create.shape[0]
+
+        # Apply destroy operators
+        xd_down = x_down.at[k_d_down].set(0)
+        xd_up = x_up.at[k_d_up].set(0)
+
+        # For each create option, check if it produces (y_down, y_up)
+        def check_create_option(opt_idx):
+            l_c = l_create[opt_idx]
+            w = weight[opt_idx]
+
+            # Extract create sites for each sector
+            l_c_down = l_c[0]
+            l_c_up = l_c[1]
+
+            # Apply create operators
+            xp_down = xd_down.at[l_c_down].set(1)
+            xp_up = xd_up.at[l_c_up].set(1)
+
+            # Check if this produces (y_down, y_up)
+            produces_y = jnp.all(xp_down == y_down) & jnp.all(xp_up == y_up)
+
+            # Check Pauli exclusion
+            create_was_empty_down = ~xd_down[l_c_down].astype(bool)
+            create_was_empty_up = ~xd_up[l_c_up].astype(bool)
+            create_was_empty = create_was_empty_down & create_was_empty_up
+
+            # Compute Jordan-Wigner signs
+            m = jnp.arange(n_sites, dtype=jnp.int32)
+
+            # Down sector JW sign
+            jw_mask_destroy_down = k_d_down > m
+            jw_mask_create_down = l_c_down > m
+            sgn_destroy_down = jax.lax.reduce_xor(jw_mask_destroy_down * x_down, axes=(0,))
+            sgn_create_down = jax.lax.reduce_xor(jw_mask_create_down * xd_down, axes=(0,))
+
+            # Up sector JW sign
+            jw_mask_destroy_up = k_d_up > m
+            jw_mask_create_up = l_c_up > m
+            sgn_destroy_up = jax.lax.reduce_xor(jw_mask_destroy_up * x_up, axes=(0,))
+            sgn_create_up = jax.lax.reduce_xor(jw_mask_create_up * xd_up, axes=(0,))
+
+            # Total sign (combine both sectors)
+            sgn = sgn_create_down + sgn_destroy_down + sgn_create_up + sgn_destroy_up
+            sgn = jax.lax.bitwise_and(sgn, jnp.ones_like(sgn)).astype(bool)
+            sign = 1 - 2 * sgn.astype(np.int8)
+
+            # Return contribution if this path leads to (y_down, y_up)
+            is_valid = produces_y & create_was_empty
+            return jnp.where(is_valid, w * sign, 0.0)
+
+        # Sum contributions from all create options
+        contributions = jax.vmap(check_create_option)(jnp.arange(n_options))
+        return jnp.sum(contributions)
+
+    # Sum contributions from all (destroy_down, destroy_up) combinations
+    total_mel = jnp.sum(jax.vmap(check_destroy_combo)(k_destroy_down, k_destroy_up))
+
+    return total_mel
+
+
+def _compute_mel_xy_single_sector(
+    x_sector: Array,
+    y_sector: Array,
+    other_sectors_x: list[Array],
+    other_sectors_y: list[Array],
+    sector_idx: int,
+    index_array: Array | COOArray | None,
+    create_array: Array | None,
+    weight_array: Array,
+    n_fermions: int,
+) -> Array:
+    r"""
+    Compute <y|H_sector|x> for a single-sector operator in a multi-sector system.
+
+    The operator acts only on sector_idx. For the matrix element to be non-zero,
+    all OTHER sectors must be unchanged (y_other == x_other).
+
+    Args:
+        x_sector, y_sector: occupation vectors for the active sector
+        other_sectors_x, other_sectors_y: occupation vectors for all other sectors
+        sector_idx: index of the sector being acted upon
+        index_array, create_array, weight_array: sparse operator data
+        n_fermions: number of fermions in the active sector
+
+    Returns:
+        matrix element <y|H_sector|x> (0 if other sectors changed)
+    """
+    # Check if all other sectors are unchanged
+    other_sectors_unchanged = jnp.array(True)
+    for x_other, y_other in zip(other_sectors_x, other_sectors_y):
+        other_sectors_unchanged = other_sectors_unchanged & jnp.all(x_other == y_other)
+
+    # If other sectors changed, matrix element is zero
+    # Otherwise, compute the single-sector matrix element
+    mel_sector = _compute_mel_xy_term(
+        x_sector, y_sector, index_array, create_array, weight_array, n_fermions
+    )
+
+    return jnp.where(other_sectors_unchanged, mel_sector, 0.0)
+
+
+@partial(jax.jit, static_argnums=(0, 1, 8))
+def _get_conn_padded_scan_interaction_up_down(
+    nelectron_down: int,
+    nelectron_up: int,
+    x_down: Array,
+    x_up: Array,
+    index_array: Array | COOArray | None,
+    create_array: Array | None,
+    weight_array: Array,
+    subspace_states: Array,
+    n_total_sites: int,
+) -> tuple[Array, Array, Array]:
+    r"""
+    Memory-efficient version for mixed spin-sector interactions.
+
+    Computes <y|H_interaction|x> directly for each y in subspace.
+
+    Args:
+        nelectron_down, nelectron_up: number of electrons in each sector
+        x_down, x_up: input states (1D occupation vectors)
+        index_array, create_array, weight_array: sparse operator data
+        subspace_states: sorted array of valid state integers, shape (n_subspace,)
+        n_total_sites: total number of sites (all spin sectors combined)
+
+    Returns:
+        y_down: down-sector states, shape (n_subspace, n_sites_per_sector)
+        y_up: up-sector states, shape (n_subspace, n_sites_per_sector)
+        mels: matrix elements, shape (n_subspace,)
+    """
+    assert x_down.ndim == 1
+    assert x_up.ndim == 1
+
+    n_subspace = subspace_states.shape[0]
+    dtype = x_down.dtype
+
+    # Convert subspace integers to full packed occupation vectors
+    y_subspace_packed = _int_to_state(subspace_states, n_total_sites)
+
+    # Unpack into spin sectors
+    y_subspace_unpacked = unpack_spin_sectors(y_subspace_packed, n_spin_subsectors=2)
+    y_down_subspace = y_subspace_unpacked[0]  # Shape: (n_subspace, n_sites_per_sector)
+    y_up_subspace = y_subspace_unpacked[1]    # Shape: (n_subspace, n_sites_per_sector)
+
+    # Compute <y|H|x> for each y in subspace using vmap
+    mels = jax.vmap(
+        lambda y_d, y_u: _compute_mel_xy_term_interaction_up_down(
+            x_down, x_up, y_d, y_u,
+            index_array, create_array, weight_array,
+            nelectron_down, nelectron_up
+        )
+    )(y_down_subspace, y_up_subspace)
+
+    return y_down_subspace.astype(dtype), y_up_subspace.astype(dtype), mels
+
+
+@partial(jax.jit, static_argnums=0)
+def _get_conn_padded_scan(
+    n_fermions: int,
+    x: Array,
+    index_array: Array | COOArray | None,
+    create_array: Array | None,
+    weight_array: Array,
+    subspace_states: Array,
+) -> tuple[Array, Array]:
+    r"""
+    Memory-efficient version that computes <y|H|x> directly for each y in subspace.
+
+    Args:
+        n_fermions: number of electrons
+        x: occupation vector (1D)
+        index_array, create_array, weight_array: sparse operator data
+        subspace_states: sorted array of valid state integers, shape (n_subspace,)
+
+    Returns:
+        xp: states of shape (n_subspace, n_sites)
+        mels: matrix elements of shape (n_subspace,)
+    """
+    assert x.ndim == 1
+
+    n_subspace = subspace_states.shape[0]
+    n_sites = x.shape[0]
+    dtype = x.dtype
+
+    # Convert subspace integers to occupation vectors
+    y_subspace = _int_to_state(subspace_states, n_sites)
+
+    # Compute <y|H|x> for each y in subspace using vmap
+    mels = jax.vmap(
+        lambda y: _compute_mel_xy_term(x, y, index_array, create_array, weight_array, n_fermions)
+    )(y_subspace)
+
+    return y_subspace.astype(dtype), mels
+
+
 def _comb(kl: Array, n: int) -> Array:
     r"""
     compute all combinations of n elements from a set kl
@@ -82,13 +538,14 @@ def _jw_kernel(
 
 
 @partial(jax.jit, static_argnums=0)
-@partial(jnp.vectorize, signature="(n)->(m,n),(m)", excluded=(0, 2, 3, 4))
+@partial(jnp.vectorize, signature="(n)->(m,n),(m)", excluded=(0, 2, 3, 4, 5))
 def _get_conn_padded(
     n_fermions: int,
     x: Array,
     index_array: Array | COOArray | None,
     create_array: Array | None,
     weight_array: Array,
+    subspace_states: Array | None = None,
 ) -> tuple[Array, Array]:
     r"""
     helper function for the matrix elements functions defined below
@@ -96,13 +553,21 @@ def _get_conn_padded(
     does not know about spin sectors
 
     Args:
-        n_fermionsnumber of electrons
+        n_fermions: number of electrons
         x: occupation vectors
         index_array, create_array, weight_array: internal (sparse) operator data representation
+        subspace_states: optional array of shape (n_valid_states,) containing integer representations
+                        of valid states in the subspace. If provided, returns compacted arrays of size
+                        n_valid_states for memory efficiency.
     Returns:
         connected states and corresponding matrix elements
+        - If subspace_states is None: returns arrays of shape (n_connected, n_sites) and (n_connected,)
+        - If subspace_states provided: returns arrays of shape (n_valid_states, n_sites) and (n_valid_states,)
+          where positions correspond to states in subspace_states, and zeros indicate no connection
     """
     assert x.ndim == 1
+
+    # Original vectorized path (subspace filtering handled in get_conn_padded_pnc)
     if index_array is not None:
         half_n_ops = index_array.ndim
     else:  # diagonal
@@ -146,6 +611,7 @@ def _get_conn_padded(
 
             xp = jax.lax.collapse(xp, 0, xp.ndim - 1).astype(dtype)
             mels = jax.lax.collapse(mels, 0, mels.ndim)
+
     return xp, mels
 
 
@@ -268,7 +734,10 @@ def _get_conn_padded_interaction_up_down(
 
 @partial(jax.jit, static_argnames=("n_fermions",))
 def get_conn_padded_pnc(
-    _operator_data: PNCOperatorDataType, x: Array, n_fermions: int
+    _operator_data: PNCOperatorDataType,
+    x: Array,
+    n_fermions: int,
+    subspace_states: Array | None = None,
 ) -> tuple[Array, Array]:
     r"""
     compute the connected elements for ParticleNumberConservingFermioperator2nd
@@ -277,35 +746,88 @@ def get_conn_padded_pnc(
         _operator_data: internal sparse operator representation
         x: occupation vectors
         n_fermions: number of electrons
+        subspace_states: optional array of shape (n_valid_states,) containing integer representations
+                        of valid states in the subspace. If provided, returns compacted arrays for
+                        memory efficiency.
     Returns:
         connected states and corresponding matrix elements
+        - If subspace_states is None: shape (n_batch, n_connected, n_sites) and (n_batch, n_connected)
+        - If subspace_states provided: shape (n_batch, n_valid_states, n_sites) and (n_batch, n_valid_states)
+          Output is indexed by position in subspace_states, zeros indicate no connection
     """
     dtype = x.dtype
     if not jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.integer):
         x = x.astype(jnp.int8)
 
-    xp_list = []
-    mels_list = []
-    xp_diag = None
-    mels_diag = 0
-    for k, v in _operator_data["diag"].items():
-        xp, mels = _get_conn_padded(n_fermions, x, *v)
-        xp_diag = xp
-        mels_diag = mels_diag + mels
-        xp_list = [xp_diag]
-        mels_list = [mels_diag]
-    for k, v in _operator_data["offdiag"].items():
-        xp, mels = _get_conn_padded(n_fermions, x, *v)
-        xp_list.append(xp)
-        mels_list.append(mels)
-    xp = jnp.concatenate(xp_list, axis=-2)
-    mels = jnp.concatenate(mels_list, axis=-1)
-    return xp.astype(dtype), mels
+    if subspace_states is not None:
+        # When filtering to subspace: use direct <y|H|x> computation
+        # Sort subspace_states for efficient operations, track permutation
+        sort_indices = jnp.argsort(subspace_states)
+        subspace_states_sorted = subspace_states[sort_indices]
+
+        # Accumulate contributions from all operator terms
+        xp_accum = None
+        mels_accum = 0
+
+        # Use vmap to handle batch dimension
+        def compute_for_single_sample(x_single):
+            xp_local = None
+            mels_local = jnp.zeros(subspace_states_sorted.shape[0], dtype=jnp.complex128)
+
+            for k, v in _operator_data["diag"].items():
+                xp_term, mels_term = _get_conn_padded_scan(
+                    n_fermions, x_single, *v, subspace_states_sorted
+                )
+                if xp_local is None:
+                    xp_local = xp_term
+                mels_local = mels_local + mels_term
+
+            for k, v in _operator_data["offdiag"].items():
+                xp_term, mels_term = _get_conn_padded_scan(
+                    n_fermions, x_single, *v, subspace_states_sorted
+                )
+                if xp_local is None:
+                    xp_local = xp_term
+                mels_local = mels_local + mels_term
+
+            return xp_local, mels_local
+
+        # Apply to all samples in batch
+        xp_accum, mels_accum = jax.vmap(compute_for_single_sample)(x)
+
+        # Restore original user ordering
+        inverse_indices = jnp.argsort(sort_indices)
+        xp_accum = xp_accum[:, inverse_indices]
+        mels_accum = mels_accum[:, inverse_indices]
+
+        return xp_accum.astype(dtype), mels_accum
+    else:
+        # When NOT filtering: CONCATENATE (original behavior)
+        xp_list = []
+        mels_list = []
+        xp_diag = None
+        mels_diag = 0
+        for k, v in _operator_data["diag"].items():
+            xp, mels = _get_conn_padded(n_fermions, x, *v, subspace_states)
+            xp_diag = xp
+            mels_diag = mels_diag + mels
+            xp_list = [xp_diag]
+            mels_list = [mels_diag]
+        for k, v in _operator_data["offdiag"].items():
+            xp, mels = _get_conn_padded(n_fermions, x, *v, subspace_states)
+            xp_list.append(xp)
+            mels_list.append(mels)
+        xp = jnp.concatenate(xp_list, axis=-2)
+        mels = jnp.concatenate(mels_list, axis=-1)
+        return xp.astype(dtype), mels
 
 
 @partial(jax.jit, static_argnames=("n_fermions_per_spin",))
 def get_conn_padded_pnc_spin(
-    _operator_data: PNCOperatorDataType, x: Array, n_fermions_per_spin: tuple[int]
+    _operator_data: PNCOperatorDataType,
+    x: Array,
+    n_fermions_per_spin: tuple[int],
+    subspace_states: Array | None = None
 ) -> tuple[Array, Array]:
     r"""
     compute the connected elements for ParticleNumberAndSpinConservingFermioperator2nd
@@ -314,13 +836,135 @@ def get_conn_padded_pnc_spin(
         _operator_data: internal sparse operator representation
         x: occupation vectors (with concatenated spin sectors)
         n_fermions_per_spin: number of electrons in each spin sector
+        subspace_states: optional array of shape (n_valid_states,) containing integer representations
+                        of valid states in the subspace. If provided, returns compacted arrays of size
+                        n_valid_states for memory efficiency.
     Returns:
         connected states and corresponding matrix elements
+        - If subspace_states is None: returns arrays of shape (n_connected, n_sites) and (n_connected,)
+        - If subspace_states provided: returns arrays of shape (n_valid_states, n_sites) and (n_valid_states,)
     """
     n_spin_subsectors = len(n_fermions_per_spin)
+    dtype = x.dtype
+    if not jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.integer):
+        x = x.astype(jnp.int8)
+
+    if subspace_states is not None:
+        # When filtering to subspace: use direct <y|H|x> computation
+        # Sort subspace_states for efficient operations, track permutation
+        sort_indices = jnp.argsort(subspace_states)
+        subspace_states_sorted = subspace_states[sort_indices]
+
+        # Get n_total_sites from x
+        n_total_sites = x.shape[-1]
+
+        # Use vmap to handle batch dimension
+        def compute_for_single_sample(x_single):
+            # Unpack spin sectors for x
+            xs = unpack_spin_sectors(x_single, n_spin_subsectors)
+
+            # Initialize accumulator
+            mels_local = jnp.zeros(subspace_states_sorted.shape[0], dtype=jnp.complex128)
+            xp_local = None
+
+            # Initialize xp_local if not done
+            if xp_local is None:
+                y_subspace_packed = _int_to_state(subspace_states_sorted, n_total_sites)
+                xp_local = y_subspace_packed
+
+            # Unpack all y states in subspace into sectors (vmap over batch)
+            # This returns a tuple of arrays, each of shape (n_subspace, n_sites_per_sector)
+            ys_subspace_tuple = jax.vmap(
+                lambda y_packed: unpack_spin_sectors(y_packed, n_spin_subsectors)
+            )(y_subspace_packed)
+
+            # Accumulate from diagonal terms (single sector)
+            for (k, sectors), v in _operator_data["diag"].items():
+                if k == 0:
+                    assert sectors == ()
+                    sectors = (0,)  # dummy sector
+
+                for i in sectors:
+                    # For each y in subspace, compute <y|H_sector_i|x>
+                    def compute_mel_for_y(y_sectors):
+                        # y_sectors is a tuple of occupation vectors for all sectors
+                        y_sector_i = y_sectors[i]
+                        # Other sectors (all except i)
+                        other_sectors_x = tuple(xs[j] for j in range(n_spin_subsectors) if j != i)
+                        other_sectors_y = tuple(y_sectors[j] for j in range(n_spin_subsectors) if j != i)
+
+                        return _compute_mel_xy_single_sector(
+                            xs[i], y_sector_i, other_sectors_x, other_sectors_y,
+                            i, *v, n_fermions_per_spin[i]
+                        )
+
+                    # Transpose ys_subspace_tuple to get list of tuples instead of tuple of lists
+                    # Actually, vmap over the first dimension of each array in the tuple
+                    mels_term = jax.vmap(compute_mel_for_y)(ys_subspace_tuple)
+                    mels_local = mels_local + mels_term
+
+            # Accumulate from mixed diagonal (interactions between sectors)
+            for (k, sectors), v in _operator_data["mixed_diag"].items():
+                if k != 4:
+                    raise NotImplementedError
+
+                for i, j in sectors:
+                    assert i > j  # here i>j (e.g., i=up, j=down)
+                    # Use the mixed interaction function
+                    _, _, mels_term = _get_conn_padded_scan_interaction_up_down(
+                        n_fermions_per_spin[j], n_fermions_per_spin[i],
+                        xs[j], xs[i], *v,
+                        subspace_states_sorted, n_total_sites
+                    )
+                    mels_local = mels_local + mels_term
+
+            # Accumulate from off-diagonal terms (single sector)
+            for (k, sectors), v in _operator_data["offdiag"].items():
+                for i in sectors:
+                    # For each y in subspace, compute <y|H_sector_i|x>
+                    def compute_mel_for_y(y_sectors):
+                        y_sector_i = y_sectors[i]
+                        # Other sectors (all except i)
+                        other_sectors_x = tuple(xs[j] for j in range(n_spin_subsectors) if j != i)
+                        other_sectors_y = tuple(y_sectors[j] for j in range(n_spin_subsectors) if j != i)
+
+                        return _compute_mel_xy_single_sector(
+                            xs[i], y_sector_i, other_sectors_x, other_sectors_y,
+                            i, *v, n_fermions_per_spin[i]
+                        )
+
+                    mels_term = jax.vmap(compute_mel_for_y)(ys_subspace_tuple)
+                    mels_local = mels_local + mels_term
+
+            # Accumulate from mixed off-diagonal (interactions between sectors)
+            for (k, sectors), v in _operator_data["mixed_offdiag"].items():
+                if k != 4:
+                    raise NotImplementedError
+
+                for i, j in sectors:
+                    assert i > j
+                    _, _, mels_term = _get_conn_padded_scan_interaction_up_down(
+                        n_fermions_per_spin[j], n_fermions_per_spin[i],
+                        xs[j], xs[i], *v,
+                        subspace_states_sorted, n_total_sites
+                    )
+                    mels_local = mels_local + mels_term
+
+            return xp_local, mels_local
+
+        # Apply to all samples in batch
+        xp_accum, mels_accum = jax.vmap(compute_for_single_sample)(x)
+
+        # Restore original user ordering
+        inverse_indices = jnp.argsort(sort_indices)
+        xp_accum = xp_accum[:, inverse_indices]
+        mels_accum = mels_accum[:, inverse_indices]
+
+        return xp_accum.astype(dtype), mels_accum
+
+    # When NOT filtering: ORIGINAL behavior
     xs = unpack_spin_sectors(x, n_spin_subsectors)
     xs_diag = tuple(a[..., None, :] for a in xs)
-    dtype = xs[0].dtype
 
     xp_list = []
     mels_list = []
