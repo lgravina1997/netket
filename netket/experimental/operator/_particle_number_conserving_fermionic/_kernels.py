@@ -545,6 +545,7 @@ def _get_conn_padded(
     index_array: Array | COOArray | None,
     create_array: Array | None,
     weight_array: Array,
+    subspace_states: Array | None = None,
 ) -> tuple[Array, Array]:
     r"""
     helper function for the matrix elements functions defined below
