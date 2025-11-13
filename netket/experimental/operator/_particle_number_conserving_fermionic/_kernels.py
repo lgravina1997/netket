@@ -545,7 +545,6 @@ def _get_conn_padded(
     index_array: Array | COOArray | None,
     create_array: Array | None,
     weight_array: Array,
-    subspace_states: Array | None = None,
 ) -> tuple[Array, Array]:
     r"""
     helper function for the matrix elements functions defined below
@@ -560,10 +559,7 @@ def _get_conn_padded(
                         of valid states in the subspace. If provided, returns compacted arrays of size
                         n_valid_states for memory efficiency.
     Returns:
-        connected states and corresponding matrix elements
-        - If subspace_states is None: returns arrays of shape (n_connected, n_sites) and (n_connected,)
-        - If subspace_states provided: returns arrays of shape (n_valid_states, n_sites) and (n_valid_states,)
-          where positions correspond to states in subspace_states, and zeros indicate no connection
+        Connected states and corresponding matrix elements. Returns arrays of shape (n_connected, n_sites) and (n_connected,)
     """
     assert x.ndim == 1
 
