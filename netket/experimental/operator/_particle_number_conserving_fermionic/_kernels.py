@@ -44,51 +44,6 @@ def _int_to_state(state_int: Array, n_sites: int) -> Array:
     return ((state_int[..., None] & powers) > 0).astype(jnp.int8)
 
 
-def _compact_to_subspace(
-    xp: Array, mels: Array, subspace_states: Array
-) -> tuple[Array, Array]:
-    r"""
-    Compact connected elements to subspace-sized arrays for memory efficiency.
-
-    Args:
-        xp: connected states of shape (n_connected, n_sites)
-        mels: matrix elements of shape (n_connected,)
-        subspace_states: sorted array of valid state integers, shape (n_subspace,)
-
-    Returns:
-        xp_compact: states of shape (n_subspace, n_sites), zeros for non-connected
-        mels_compact: matrix elements of shape (n_subspace,), zeros for non-connected
-    """
-    n_subspace = subspace_states.shape[0]
-    n_sites = xp.shape[-1]
-
-    # Initialize output arrays with zeros
-    xp_compact = jnp.zeros((n_subspace, n_sites), dtype=xp.dtype)
-    mels_compact = jnp.zeros(n_subspace, dtype=mels.dtype)
-
-    # Convert connected states to integers
-    xp_ints = _state_to_int(xp)
-
-    # For each connected state, find its index in subspace and place it there
-    # Using searchsorted for O(log n_subspace) lookup per element
-    indices = jnp.searchsorted(subspace_states, xp_ints)
-
-    # Check if the found index is valid and the value matches
-    # (searchsorted can return n_subspace if element > all elements)
-    valid_mask = (indices < n_subspace) & (subspace_states[indices] == xp_ints)
-
-    # Use scatter to place elements at their subspace positions
-    # Only update positions where valid_mask is True
-    xp_compact = xp_compact.at[jnp.where(valid_mask, indices, 0)].set(
-        jnp.where(valid_mask[:, None], xp, 0)
-    )
-    mels_compact = mels_compact.at[jnp.where(valid_mask, indices, 0)].add(
-        jnp.where(valid_mask, mels, 0)
-    )
-
-    return xp_compact, mels_compact
-
-
 def _compute_mel_xy_term(
     x: Array,
     y: Array,
