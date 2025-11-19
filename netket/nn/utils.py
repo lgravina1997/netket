@@ -43,6 +43,7 @@ def to_array(
     normalize: bool = True,
     allgather: bool = True,
     chunk_size: int | None = None,
+    machine_pow: int = 2,
 ) -> Array:
     """
     Computes `apply_fun(variables, states)` on all states of `hilbert` and returns
@@ -84,6 +85,7 @@ def to_array(
         allgather,
         chunk_size,
         mask,
+        machine_pow=machine_pow,
     )
 
     if allgather and config.netket_experimental_sharding:  # type: ignore
@@ -102,6 +104,7 @@ def _to_array_rank(
     allgather,
     chunk_size,
     mask=None,
+    machine_pow: int = 2,
 ):
     """
     Computes apply_fun(variables, σ_rank) and gathers all results across all ranks.
@@ -139,8 +142,8 @@ def _to_array_rank(
 
     if normalize:
         # compute normalization
-        norm2 = jnp.linalg.norm(psi_local) ** 2
-        psi_local /= jnp.sqrt(norm2)
+        norm_pow = jnp.sum(jnp.abs(psi_local) ** machine_pow)
+        psi_local /= norm_pow ** (1 / machine_pow)
 
     if allgather:
         psi = psi_local.reshape(-1)

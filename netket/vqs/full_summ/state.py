@@ -57,8 +57,8 @@ def jit_evaluate(fun: Callable, *args):
 
 
 @jax.jit
-def _array_to_pdf(v):
-    return jnp.abs(v) ** 2
+def _array_to_pdf(v, machine_pow: int = 2) -> jax.Array:
+    return jnp.abs(v) ** machine_pow
 
 
 class FullSumState(VariationalState):
@@ -75,6 +75,9 @@ class FullSumState(VariationalState):
     """The function used to initialise the parameters and model_state"""
     _apply_fun: Callable
     """The function used to evaluate the model"""
+    
+    _machine_pow: int = 2
+    """The power to which the wavefunction amplitudes are raised to compute probabilities."""
 
     _chunk_size: int | None = None
 
@@ -90,6 +93,7 @@ class FullSumState(VariationalState):
         seed: SeedT | None = None,
         mutable: CollectionFilter = False,
         training_kwargs: dict = {},
+        machine_pow: int = 2,
         dtype=float,
     ):
         """
@@ -115,6 +119,7 @@ class FullSumState(VariationalState):
                 but will trade a higher computational cost for lower memory cost.
         """
         super().__init__(hilbert)
+        self._machine_pow = machine_pow
         self._model_framework = None
 
         if variables is not None and config.netket_experimental_sharding:
@@ -345,6 +350,7 @@ class FullSumState(VariationalState):
                 normalize=normalize,
                 allgather=allgather,
                 chunk_size=self.chunk_size,
+                machine_pow=self._machine_pow,
             )
 
         if normalize:
@@ -357,13 +363,14 @@ class FullSumState(VariationalState):
                 normalize=normalize,
                 allgather=allgather,
                 chunk_size=self.chunk_size,
+                machine_pow=self._machine_pow,
             )
 
         return arr  # type: ignore
 
-    def probability_distribution(self):
+    def probability_distribution(self,) -> jax.Array:
         if self._pdf is None:
-            self._pdf = _array_to_pdf(self.to_array())
+            self._pdf = _array_to_pdf(self.to_array(), machine_pow=self._machine_pow)
 
         return self._pdf
 
