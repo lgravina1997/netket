@@ -19,7 +19,21 @@ def get_conn_padded_pnc_truncated(
     n_fermions: int,
 ) -> tuple[Array, Array]:
     r"""
+    Compute the connected states and matrix elements for a particle-number-conserving fermionic operator,
+    using an approximate approach where only diagonal terms and up to one-body off-diagonal terms are fully considered. 
+    Two-body off-diagonal terms are computed separately and restricted to the truncation set defined by `y`.
     
+    Args:
+        _operator_data: Precomputed operator data containing diagonal and off-diagonal elements.
+        x: Input state array of shape (n,). This argument is vectorized over.
+        y: Truncation set of states of shape (m, n).
+        n_fermions: Number of fermions in the system.
+        
+    Returns:
+        xp: Array of connected states including those from the truncation set, shape (m + p, n).
+        mels: Corresponding matrix elements for the connected states, shape (m + p,).
+        
+    Above, `p` is the number of connected states generated from diagonal and one-body off-diagonal terms.
     """
     
     dtype = x.dtype
