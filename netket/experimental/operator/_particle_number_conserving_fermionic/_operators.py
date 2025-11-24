@@ -1,5 +1,5 @@
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -46,6 +46,7 @@ from ._operator_data import (
     CoordsDataDictSectorType,
 )
 from ._kernels import get_conn_padded_pnc, get_conn_padded_pnc_spin
+from ._kernels_truncated import get_conn_padded_pnc_truncated, get_conn_padded_pnc_spin_truncated
 
 
 @struct.dataclass
@@ -86,8 +87,14 @@ class ParticleNumberConservingFermioperator2nd(DiscreteJaxOperator):
         PNCOperatorDataCollectionDict  # custom sparse internal representation
     )
 
-    def get_conn_padded(self, x):
-        return get_conn_padded_pnc(self._operator_data, x, self._hilbert.n_fermions)
+    def get_conn_padded(self, x, y: Optional[Array] = None):
+        if y is None:
+            xp, mels = get_conn_padded_pnc(self._operator_data, x, self._hilbert.n_fermions)
+        else:
+            xp, mels = get_conn_padded_pnc_truncated(self._operator_data, x, self._hilbert.n_fermions)
+        xp, inverse_indices = jnp.unique(xp, axis=0, return_inverse=True)
+        mels = jax.ops.segment_sum(mels, inverse_indices, num_segments=len(xp))
+        return xp, mels
 
     @property
     def max_conn_size(self):
