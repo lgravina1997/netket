@@ -118,7 +118,7 @@ def get_conn_padded_pnc_spin_truncated(
                 xs[j] == ys[j], axis=-1
             )  # 2-body transitions within the same spin sector i are only allowed if the other sector j remains unchanged
             mels_offdiag += (
-                _get_mel_offdiag(n_fermions_per_spin, xs[i], ys[i], *v) * is_allowed
+                _get_mel_offdiag(n_fermions_per_spin[i], xs[i], ys[i], *v) * is_allowed
             )
 
     # Take only mixed off-diagonal elements with k == 4 (two-body terms) excluded from _operator_data_reduced

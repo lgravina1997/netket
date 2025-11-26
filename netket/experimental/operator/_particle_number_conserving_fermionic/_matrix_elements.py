@@ -143,7 +143,7 @@ def _get_mel_offdiag(
 @partial(jax.jit, static_argnames=['n_fermions_per_spin'])
 @partial(jnp.vectorize, signature="(n),(n)->()", excluded=(0, 1, 2, 5, 6, 7))
 def _get_mel_mixed_offdiag(
-    n_fermions_per_spin: int,    
+    n_fermions_per_spin: tuple[int],    
     x_down: Array,
     x_up: Array,
     y_down: Array,
@@ -184,7 +184,7 @@ def _get_mel_mixed_offdiag(
     def case_hop_in_down():
         # Hop in down, same-site in up
         k_destroy_down, l_create_down = select_changes(x_down, y_down, k=2)
-        same_sites_up = jnp.where((x_up & y_up), size=n_fermions_per_spin, fill_value=-1)[0]
+        same_sites_up = jnp.where((x_up & y_up), size=n_fermions_per_spin[1], fill_value=-1)[0]
         
         def f_one_site(j_up):
             ind = index_array[k_destroy_down[0], j_up]
@@ -204,7 +204,7 @@ def _get_mel_mixed_offdiag(
     def case_hop_in_up():
         # Hop in up, same-site in down
         k_destroy_up, l_create_up = select_changes(x_up, y_up, k=2)
-        same_sites_down = jnp.where((x_down & y_down), size=n_fermions_per_spin, fill_value=-1)[0]
+        same_sites_down = jnp.where((x_down & y_down), size=n_fermions_per_spin[0], fill_value=-1)[0]
         
         def f_one_site(j_down):
             ind = index_array[j_down, k_destroy_up[0]]
