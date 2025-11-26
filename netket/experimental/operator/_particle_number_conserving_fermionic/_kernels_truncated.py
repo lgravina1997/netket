@@ -39,7 +39,7 @@ def get_conn_padded_pnc_truncated(
     dtype = x.dtype
     if not jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.integer):
         x = x.astype(jnp.int8)
-        
+
     # Take all diagonal elements and only off-diagonal elements with k < 4
     _operator_data_reduced = {
         "diag": _operator_data.get("diag", {}),
@@ -101,19 +101,25 @@ def get_conn_padded_pnc_spin_truncated(
 
     xs = unpack_spin_sectors(x, n_spin_subsectors)  # ((batch, n), (batch,n))
     ys = unpack_spin_sectors(y, n_spin_subsectors)  # ((batch, n), (batch,n))
-    
+
     # Take only off-diagonal elements with k == 4 (two-body terms) excluded from _operator_data_reduced
     _operator_data_2body_offdiag = {
         (k, sectors): v
         for (k, sectors), v in _operator_data.get("offdiag", {}).items()
         if k == 4
     }
-    
+
     mels_offdiag = jnp.zeros(y.shape[0], dtype=mels_reduced.dtype)
     for (k, sectors), v in _operator_data_2body_offdiag.items():
         assert k == 4, "This loop should only process k == 4 terms"
         for i in sectors:
-            mels_offdiag += _get_mel_offdiag(n_fermions_per_spin, xs[i], ys[i], *v)
+            j = 1 - i  # other sector than the one selected. assume 2 sectors: 0 and 1
+            is_allowed = jnp.all(
+                xs[j] == ys[j], axis=-1
+            )  # 2-body transitions within the same spin sector i are only allowed if the other sector j remains unchanged
+            mels_offdiag += (
+                _get_mel_offdiag(n_fermions_per_spin, xs[i], ys[i], *v) * is_allowed
+            )
 
     # Take only mixed off-diagonal elements with k == 4 (two-body terms) excluded from _operator_data_reduced
     _operator_data_2body_mixed_offdiag = {
@@ -125,7 +131,9 @@ def get_conn_padded_pnc_spin_truncated(
     mels_mixed_offdiag = jnp.zeros(y.shape[0], dtype=mels_reduced.dtype)
     for (k, sectors), v in _operator_data_2body_mixed_offdiag.items():
         assert k == 4, "This loop should only process k == 4 terms"
-        mels_mixed_offdiag += _get_mel_mixed_offdiag(n_fermions_per_spin, xs[0], xs[1], ys[0], ys[1], *v)
+        mels_mixed_offdiag += _get_mel_mixed_offdiag(
+            n_fermions_per_spin, xs[0], xs[1], ys[0], ys[1], *v
+        )
 
     mels_2body = mels_offdiag + mels_mixed_offdiag
     xp = jnp.concatenate([xp_reduced, y], axis=-2)
