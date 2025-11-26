@@ -11,7 +11,7 @@ from ._matrix_elements import _get_mel_offdiag, _get_mel_mixed_offdiag
 
 
 @partial(jax.jit, static_argnames=("n_fermions",))
-# @partial(jnp.vectorize, signature="(n)->(m,n),(m)", excluded=(0, 2, 3))
+@partial(jnp.vectorize, signature="(n)->(m,n),(m)", excluded=(0, 2, 3))
 def get_conn_padded_pnc_truncated(
     _operator_data: PNCOperatorDataType,
     x: Array,
@@ -39,7 +39,7 @@ def get_conn_padded_pnc_truncated(
     dtype = x.dtype
     if not jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.integer):
         x = x.astype(jnp.int8)
-
+        
     # Take all diagonal elements and only off-diagonal elements with k < 4
     _operator_data_reduced = {
         "diag": _operator_data.get("diag", {}),
@@ -60,11 +60,7 @@ def get_conn_padded_pnc_truncated(
     mels_offdiag = jnp.zeros(y.shape[0], dtype=mels_reduced.dtype)
     for k, v in _operator_data_2body_offdiag.items():
         assert k == 4, "This loop should only process k == 4 terms"
-        # TODO: check batching with Clemens
-        _get_mel_offdiag_batched = jax.vmap(
-            lambda xi, v=v: _get_mel_offdiag(xi, y, *v), in_axes=0
-        )
-        mels_offdiag += _get_mel_offdiag_batched(x)
+        mels_offdiag += _get_mel_offdiag(n_fermions, x, y, *v)
 
     # Note that xp_reduced may contain duplicates with respect to y.
     # The mels associated to those duplicates should be summed together outside this function.
@@ -74,6 +70,7 @@ def get_conn_padded_pnc_truncated(
 
 
 @partial(jax.jit, static_argnames=("n_fermions_per_spin",))
+@partial(jnp.vectorize, signature="(n)->(m,n),(m)", excluded=(0, 2, 3))
 def get_conn_padded_pnc_spin_truncated(
     _operator_data: PNCOperatorDataType,
     x: Array,
@@ -116,11 +113,7 @@ def get_conn_padded_pnc_spin_truncated(
     for (k, sectors), v in _operator_data_2body_offdiag.items():
         assert k == 4, "This loop should only process k == 4 terms"
         for i in sectors:
-            yi = ys[i]  # (batch, n) for this sector
-            _get_mel_offdiag_batched = jax.vmap(
-                lambda xi, yi=yi, v=v: _get_mel_offdiag(xi, yi, *v), in_axes=0
-            )
-            mels_offdiag += _get_mel_offdiag_batched(xs[i])
+            mels_offdiag += _get_mel_offdiag(n_fermions_per_spin, xs[i], ys[i], *v)
 
     # Take only mixed off-diagonal elements with k == 4 (two-body terms) excluded from _operator_data_reduced
     _operator_data_2body_mixed_offdiag = {
@@ -132,8 +125,9 @@ def get_conn_padded_pnc_spin_truncated(
     mels_mixed_offdiag = jnp.zeros(y.shape[0], dtype=mels_reduced.dtype)
     for (k, sectors), v in _operator_data_2body_mixed_offdiag.items():
         assert k == 4, "This loop should only process k == 4 terms"
-        
-        _get_mel_mixed_offdiag_batched = jax.vmap(
-            lambda x_up, x_dw, v=v: _get_mel_mixed_offdiag(x_up, x_dw, ys[0], ys[1], *v), in_axes=0
-        )
-        mels_mixed_offdiag += _get_mel_mixed_offdiag_batched(xs[0], xs[1])
+        mels_mixed_offdiag += _get_mel_mixed_offdiag(n_fermions_per_spin, xs[0], xs[1], ys[0], ys[1], *v)
+
+    mels_2body = mels_offdiag + mels_mixed_offdiag
+    xp = jnp.concatenate([xp_reduced, y], axis=-2)
+    mels = jnp.concatenate([mels_reduced, mels_2body], axis=-1)
+    return xp, mels
