@@ -155,16 +155,12 @@ def _get_mel_mixed_offdiag(
     """
     Compute matrix element for mixed_offdiag (cross-sector) two-body operators.
     Handles transitions where one sector has a hop and the other has same-site. For example:
-    x_down = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
-    x_up   = [1, 0, 0, 1, 0, 0 || 0, 1, 0, 1, 0, 0]
-    y_down = [1, 0, 0, 1, 0, 0 || 0, 1, 0, 1, 0, 0]
-    y_up   = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    x = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    y = [0, 0, 0, 1, 1, 0 || 1, 1, 0, 0, 0, 0]
     
     or transitions where there is a hop in both sectors:
-    x_down = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
-    x_up   = [1, 0, 0, 1, 0, 0 || 0, 1, 0, 1, 0, 0]
-    y_down = [1, 0, 0, 0, 0, 1 || 1, 1, 0, 0, 0, 0]
-    y_up   = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    x = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    y = [1, 0, 0, 0, 0, 1 || 1, 0, 1, 0, 0, 0]
     
     Args:
         n_fermions_per_spin: Number of fermions in each spin sector.
