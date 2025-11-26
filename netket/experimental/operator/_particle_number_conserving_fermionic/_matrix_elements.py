@@ -31,7 +31,6 @@ def jw_sign_fast(x, k_destroy, l_create):
     """
     Fast and correct Jordan–Wigner sign that matches the original implementation.
     """
-
     prefix = jnp.cumsum(x) - x # number of ones to the left
     parity_destroy = jnp.sum(prefix[k_destroy])
 
@@ -135,8 +134,7 @@ def _get_mel_offdiag(
             return compute(k_destroy, l_create, ind)
 
         mels = jax.vmap(f_one_site)(same_sites) # vectorize over all i in same_sites
-        valid_mask = same_sites != -1 # mask out padding (-1 entries)
-        return jnp.sum(mels * valid_mask)
+        return jnp.sum(mels)
 
     d = hamming_distance(x, y)
     return jnp.where(d == 4, case_k4(), jnp.where(d == 2, case_k2(), 0.0))
@@ -186,7 +184,7 @@ def _get_mel_mixed_offdiag(
     def case_hop_in_down():
         # Hop in down, same-site in up
         k_destroy_down, l_create_down = select_changes(x_down, y_down, k=2)
-        same_sites_up = jnp.where((x_up & y_up), size=n_fermions_per_spin-1, fill_value=-1)[0]
+        same_sites_up = jnp.where((x_up & y_up), size=n_fermions_per_spin, fill_value=-1)[0]
         
         def f_one_site(j_up):
             ind = index_array[k_destroy_down[0], j_up]
@@ -201,13 +199,12 @@ def _get_mel_mixed_offdiag(
             return jnp.where(found, sgn * weight_array[ind, idx], 0.0)
         
         mels = jax.vmap(f_one_site)(same_sites_up)
-        valid_mask = same_sites_up != -1
-        return jnp.sum(mels * valid_mask)
+        return jnp.sum(mels)
     
     def case_hop_in_up():
         # Hop in up, same-site in down
         k_destroy_up, l_create_up = select_changes(x_up, y_up, k=2)
-        same_sites_down = jnp.where((x_down & y_down), size=n_fermions_per_spin-1, fill_value=-1)[0]
+        same_sites_down = jnp.where((x_down & y_down), size=n_fermions_per_spin, fill_value=-1)[0]
         
         def f_one_site(j_down):
             ind = index_array[j_down, k_destroy_up[0]]
@@ -222,8 +219,7 @@ def _get_mel_mixed_offdiag(
             return jnp.where(found, sgn * weight_array[ind, idx], 0.0)
         
         mels = jax.vmap(f_one_site)(same_sites_down)
-        valid_mask = same_sites_down != -1
-        return jnp.sum(mels * valid_mask)
+        return jnp.sum(mels)
     
     def case_hop_in_both():
         # Hop in both sectors 
