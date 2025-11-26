@@ -44,9 +44,10 @@ def jw_sign_fast(x, k_destroy, l_create):
     return 1 - 2 * total_parity # (-1)^parity
 
 
-@jax.jit
-@partial(jnp.vectorize, signature="(n)->()", excluded=(0, 2, 3, 4))
+@partial(jax.jit, static_argnames=['n_fermions'])
+@partial(jnp.vectorize, signature="(n)->()", excluded=(0, 1, 3, 4, 5))
 def _get_mel_offdiag(
+    n_fermions: int,
     x: Array,
     y: Array,
     index_array: Array | COOArray | None,
@@ -61,6 +62,8 @@ def _get_mel_offdiag(
         c^\dagger_{i} c^\dagger_{j} c_{k} c_{l}
         
     Args:
+        n_fermions: int 
+            Number of fermions in the system.
         x: Array
             Initial state (1D array of 0/1 values).
         y: Array
@@ -77,14 +80,14 @@ def _get_mel_offdiag(
             The matrix element connecting `x` to `y`.
     """
     def compute(k_destroy, l_create, ind):
-        creates = create_array[ind] # shape (n_max, 4)
+        creates = create_array[ind] # shape (n_max, n_fermions)
         
-        # idx = jnp.all(creates == l_create[..., None, :], axis=-1)
         mask = jnp.all(creates == l_create[..., None, :], axis=-1)
-        idx = jnp.sum(jnp.arange(creates.shape[-2]) * mask, axis=-1)
+        idx = jnp.argmax(mask)
+        found = mask[idx]
         
         sgn = jw_sign_fast(x, k_destroy, l_create)
-        return sgn * weight_array[ind, idx]
+        return jnp.where(found, sgn * weight_array[ind, idx], 0.0)
 
     def case_k4():
         r"""
@@ -116,7 +119,7 @@ def _get_mel_offdiag(
         y = [1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0]
         """
         k_destroy_, l_create_ = select_changes(x, y, k=2) # identifies the two sites that are different
-        same_sites = jnp.where((x & y), size=3, fill_value=-1)[0] # all sites where a particle could have been both destroyed and created
+        same_sites = jnp.where((x & y), size=n_fermions-1, fill_value=-1)[0] # all sites where a particle could have been both destroyed and created
         
         def f_one_site(i):
             r"""
@@ -139,9 +142,10 @@ def _get_mel_offdiag(
     return jnp.where(d == 4, case_k4(), jnp.where(d == 2, case_k2(), 0.0))
 
 
-@jax.jit
-@partial(jnp.vectorize, signature="(n),(n)->()", excluded=(0, 1, 4, 5, 6))
+@partial(jax.jit, static_argnames=['n_fermions_per_spin'])
+@partial(jnp.vectorize, signature="(n),(n)->()", excluded=(0, 1, 2, 5, 6, 7))
 def _get_mel_mixed_offdiag(
+    n_fermions_per_spin: int,    
     x_down: Array,
     x_up: Array,
     y_down: Array,
@@ -153,12 +157,19 @@ def _get_mel_mixed_offdiag(
     """
     Compute matrix element for mixed_offdiag (cross-sector) two-body operators.
     Handles transitions where one sector has a hop and the other has same-site. For example:
-    x_down = [1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
-    x_up   = [1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0]
-    y_down = [1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0]
-    y_up   = [1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]
+    x_down = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    x_up   = [1, 0, 0, 1, 0, 0 || 0, 1, 0, 1, 0, 0]
+    y_down = [1, 0, 0, 1, 0, 0 || 0, 1, 0, 1, 0, 0]
+    y_up   = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    
+    or transitions where there is a hop in both sectors:
+    x_down = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
+    x_up   = [1, 0, 0, 1, 0, 0 || 0, 1, 0, 1, 0, 0]
+    y_down = [1, 0, 0, 0, 0, 1 || 1, 1, 0, 0, 0, 0]
+    y_up   = [1, 1, 0, 0, 0, 0 || 1, 1, 0, 0, 0, 0]
     
     Args:
+        n_fermions_per_spin: Number of fermions in each spin sector.
         x_down, x_up: Initial states for down and up sectors.
         y_down, y_up: Final states for down and up sectors.
         index_array: Precomputed index array for the two-body operator.
@@ -175,17 +186,19 @@ def _get_mel_mixed_offdiag(
     def case_hop_in_down():
         # Hop in down, same-site in up
         k_destroy_down, l_create_down = select_changes(x_down, y_down, k=2)
-        same_sites_up = jnp.where((x_up & y_up), size=3, fill_value=-1)[0]
+        same_sites_up = jnp.where((x_up & y_up), size=n_fermions_per_spin-1, fill_value=-1)[0]
         
         def f_one_site(j_up):
             ind = index_array[k_destroy_down[0], j_up]
             creates = create_array[ind]
             target = jnp.array([l_create_down[0], j_up])
-            idx = jnp.argmax(jnp.all(creates == target, axis=1))
             
-            weight = weight_array[ind, idx]
+            mask = jnp.all(creates == target, axis=1)
+            idx = jnp.argmax(mask)
+            found = mask[idx]
+            
             sgn = jw_sign_fast(x_down, k_destroy_down, l_create_down)
-            return sgn * weight
+            return jnp.where(found, sgn * weight_array[ind, idx], 0.0)
         
         mels = jax.vmap(f_one_site)(same_sites_up)
         valid_mask = same_sites_up != -1
@@ -194,22 +207,40 @@ def _get_mel_mixed_offdiag(
     def case_hop_in_up():
         # Hop in up, same-site in down
         k_destroy_up, l_create_up = select_changes(x_up, y_up, k=2)
-        same_sites_down = jnp.where((x_down & y_down), size=3, fill_value=-1)[0]
+        same_sites_down = jnp.where((x_down & y_down), size=n_fermions_per_spin-1, fill_value=-1)[0]
         
         def f_one_site(j_down):
             ind = index_array[j_down, k_destroy_up[0]]
             creates = create_array[ind]
             target = jnp.array([j_down, l_create_up[0]])
-            idx = jnp.argmax(jnp.all(creates == target, axis=1))
             
-            weight = weight_array[ind, idx]
+            mask = jnp.all(creates == target, axis=1)
+            idx = jnp.argmax(mask)
+            found = mask[idx]
+            
             sgn = jw_sign_fast(x_up, k_destroy_up, l_create_up)
-            return sgn * weight
+            return jnp.where(found, sgn * weight_array[ind, idx], 0.0)
         
         mels = jax.vmap(f_one_site)(same_sites_down)
         valid_mask = same_sites_down != -1
         return jnp.sum(mels * valid_mask)
     
+    def case_hop_in_both():
+        # Hop in both sectors 
+        k_destroy_down, l_create_down = select_changes(x_down, y_down, k=2)
+        k_destroy_up, l_create_up = select_changes(x_up, y_up, k=2)
+        ind = index_array[k_destroy_down[0], k_destroy_up[0]]
+        creates = create_array[ind]
+        target = jnp.array([l_create_down[0], l_create_up[0]])
+        
+        mask = jnp.all(creates == target, axis=1)
+        idx = jnp.argmax(mask)
+        found = mask[idx]
+        
+        sgn_down = jw_sign_fast(x_down, k_destroy_down, l_create_down)
+        sgn_up = jw_sign_fast(x_up, k_destroy_up, l_create_up)
+        return jnp.where(found, sgn_down * sgn_up * weight_array[ind, idx], 0.0)
+
     # Select based on which sector has the hop
     return jnp.where(
         (d_down == 2) & (d_up == 0),
@@ -217,7 +248,10 @@ def _get_mel_mixed_offdiag(
         jnp.where(
             (d_down == 0) & (d_up == 2),
             case_hop_in_up(),
-            0.0
+            jnp.where(
+                (d_down == 2) & (d_up == 2),
+                case_hop_in_both(),
+                0.0
+            )
         )
     )
-    
