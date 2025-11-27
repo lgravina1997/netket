@@ -91,7 +91,8 @@ class ParticleNumberConservingFermioperator2nd(DiscreteJaxOperator):
         if y is None:
             xp, mels = get_conn_padded_pnc(self._operator_data, x, self._hilbert.n_fermions)
         else:
-            xp, mels = get_conn_padded_pnc_truncated(self._operator_data, x, self._hilbert.n_fermions)
+            y = jnp.unique(y, axis=0)
+            xp, mels = get_conn_padded_pnc_truncated(self._operator_data, x, y, self._hilbert.n_fermions)
         xp, inverse_indices = jnp.unique(xp, axis=0, return_inverse=True)
         mels = jax.ops.segment_sum(mels, inverse_indices, num_segments=len(xp))
         return xp, mels
@@ -329,10 +330,16 @@ class ParticleNumberAndSpinConservingFermioperator2nd(DiscreteJaxOperator):
         _, mels = jax.eval_shape(self.get_conn_padded, x)
         return mels.shape[-1]
 
-    def get_conn_padded(self, x):
-        return get_conn_padded_pnc_spin(
-            self._operator_data, x, self._hilbert.n_fermions_per_spin
-        )
+    def get_conn_padded(self, x, y: Optional[Array] = None):
+        if y is None:
+            return get_conn_padded_pnc_spin(
+                self._operator_data, x, self._hilbert.n_fermions_per_spin
+            )
+        else:
+            y = jnp.unique(y, axis=0)
+            return get_conn_padded_pnc_spin_truncated(
+                self._operator_data, x, y, self._hilbert.n_fermions_per_spin
+            )
 
     @classmethod
     def _from_coords_data(
